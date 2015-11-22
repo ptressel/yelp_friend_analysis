@@ -115,6 +115,12 @@ with open("my_cnf.py", "w") as cnf_py:
     cnf_py.write("database='%s'\n" % database)
 ```
 
+```{bash copy_my_cnf, echo=FALSE}
+
+# Copy both my.cnf and my_cnf.py to the data directory.
+cp -p my.cnf my_cnf.py data
+```
+
 ```{python process_user_data, echo=FALSE}
 
 import os.path
@@ -368,6 +374,84 @@ with open(os.path.join(data_dir, review_core), "rb") as review_csv, \
     for row in reader:
         if int(row[user_key_idx]) in high_friend_users:
             writer.writerow(row)
+```
+
+```{python make_batch_ranges, echo=FALSE}
+
+# Split up the keys in the reviews restricted to high-review businesses and
+# high-friend users, into ranges containing equal numbers of rows, so that the
+# SQL queries can be broken up into manageable batches.  The key values are in
+# order but not contiguous as the low-count rows are not included.  The output
+# will be pairs of key values (low, high) for each batch.
+
+import os.path
+import sys
+
+data_dir = "data"
+high_count_review = "high_count_review.csv"
+high_count_review_key_ranges = "high_count_review_key_ranges.json"
+
+# Check whether we have already created the files produced by this chunk,
+# and exit if so.
+if os.path.exists(os.path.join(data_dir, high_count_review_key_ranges)):
+    sys.exit(0)
+
+import simplejson as json
+import unicodecsv as csv
+
+MIN_COUNT = 50
+BATCH_SIZE = 1000
+
+# If I read the whole file in, I can just index into the appropriate slots
+# by slicing.  OTOH, if I read sequentially, I don't have to bring the whole
+# file in.
+
+def next_key_range(reader, key_field, batch_size):
+    """
+    Read batch_size rows having counts >= min_count, or to end of file.
+    key_field is the index for the key column in the csv file.
+    Return 1st and last key as a tuple.
+    """
+
+    # Ends of the key range.  The keys are positive integers.
+    low = 0
+    high = 0
+    num_rows = 0
+    row = None
+
+    for row in reader:
+        # Just keep storing the current key til we either run out of rows
+        # or get a full batch.  When we break, this will be at the right
+        # row.
+        high = int(row[key_field])
+        if low == 0:
+            # This is the first one we've found.
+            low = high
+        num_rows += 1
+        if num_rows >= batch_size:
+            break
+
+    if low > 0:
+        return (low, high)
+    else:
+        return None
+
+def extract_key_ranges(csv_handle, key_field, batch_size):
+    reader = csv.reader(csv_handle, delimiter=";")
+    # Skip the header.
+    reader.next()
+    key_ranges = []
+    # https://docs.python.org/2/faq/design.html#why-can-t-i-use-an-assignment-in-an-expression
+    while True:
+        key_range = next_key_range(reader, key_field, batch_size)
+        if not key_range:
+            return key_ranges
+        key_ranges.append(key_range)
+
+with open(os.path.join(data_dir, high_count_review), "rb") as csv_handle, \
+     open(os.path.join(data_dir, high_count_review_key_ranges), "wb") as key_ranges_json:
+    key_ranges = extract_key_ranges(csv_handle, 0, BATCH_SIZE)
+    json.dump(key_ranges, key_ranges_json)
 ```
 
 ```{python create_database, echo=FALSE}
@@ -649,6 +733,426 @@ try:
 except mysql.connector.Error as err:
     print "Close of db user connection failed:\n%s" % err
     sys.exit(1)
+```
+
+```{python load_data, echo=FALSE}
+
+# Load the data from the csv files into the database.
+
+# NOTE:  The MySQL server must be started with the option:
+# local_infile=1
+# else the LOAD DATA LOCAL INFILE commands will fail.  Check this by starting
+# mysql as root and doing this command:
+# select @@local_infile;
+# If that is 0, start mysqld with --local-infile=1 or put
+# local-infile=1
+# in the [mysqld] group in the main my.cnf or my.ini file and restart the
+# server.  Also put
+# local-infile=1
+# in the [client] group.  Yes, there is a discrepancy between dash and
+# underscore, yes it appears in the docs.  It may be that mysqld is converting
+# dash to underscore if it finds local-infile, but what's actually in the
+# internal server variables is local_infile, where local-infile is what's
+# shown for command options.
+
+# Have MySQL do the loads directly from the files -- this is much faster than
+# attempting to insert via Python.
+
+# Since the data is static, and only needs to be loaded once, then if the
+# table is populated, it doesn't need to be loaded again.  So check if each
+# table has data and skip its load if so.  Commit each load individually.
+
+# Begin with the tables that have no foreign key references, then load other
+# tables in topological order so that all constraint dependencies are present
+# when each table is loaded.
+
+import my_cnf
+import mysql.connector
+import os
+import sys
+
+# csv_file should be given as either an absolute path, or set the cwd and
+# then the path may be relative to that.  If on Windows, it *must* either
+# use single forward slashes as path element separators, *or* it must use
+# double backslashes *and* be in a raw string, like this:
+# r"data\\file.csv"
+# Since the above is painful to assure, we'll cd to the data directory
+# instead, and use relative paths. This is why we copied my.cnf to the
+# data directory...
+
+# Note cwd is used in the following function definition.
+cwd = os.getcwd()
+os.chdir("data")
+
+def load_table(cnx, cursor, table, csv_file):
+    # First check if this table is populated.
+    cmd = "SELECT COUNT(*) FROM %s;" % table
+    count = 0
+    try:
+        cursor.execute(cmd)
+        count = cursor.fetchone()[0]
+    except mysql.connector.Error as err:
+        print "Select count(*) failed:\n%s" % err
+        os.chdir(cwd)
+        sys.exit(1)
+    if count > 0:
+        return
+
+    # Here, the table is empty, so we can load the data.  There is one header
+    # line, items are separated by semicolons, we're not using quotes to
+    # surround text.  In fact, there is no text in the "core" database.
+
+    # Note it was required that IGNORE be last.  That's where it appears in
+    # the docs, though nothing says it is required to be there.  Yes, this
+    # works.  So, moral is, the order of clauses in the LOAD DATA statement
+    # must be exactly as shown in the documentation.
+    # https://dev.mysql.com/doc/refman/5.6/en/load-data.html
+    cmd = r"""
+    LOAD DATA LOCAL INFILE '%s' INTO TABLE %s
+    FIELDS TERMINATED BY ';' ENCLOSED BY '' ESCAPED BY ''
+    LINES STARTING BY '' TERMINATED BY '\r\n'
+    IGNORE 1 LINES;
+    """ % (csv_file, table)
+
+    try:
+        cursor.execute(cmd)
+        cnx.commit()
+    except mysql.connector.Error as err:
+        print "Load of table %s failed:\n%s" % (table, err)
+        cnx.close()
+        os.chdir(cwd)
+        sys.exit(1)
+
+# Open a connection as the database user.
+raise_on_warnings = False
+db_option_group = "client%s" % my_cnf.database
+try:
+    cnx = mysql.connector.connect(option_files="my.cnf",
+                                  option_groups=db_option_group,
+                                  database=my_cnf.database,
+                                  raise_on_warnings=raise_on_warnings)
+    cursor = cnx.cursor()
+except mysql.connector.Error as err:
+    print "Connect to MySQL server as db user failed:\n%s" % err
+    os.chdir(cwd)
+    sys.exit(1)
+
+# Load the user and business tables as these have no dependencies.
+# We don't need the category and attribute tables for now.
+
+load_table(cnx, cursor, "user", r"user_core.csv")
+load_table(cnx, cursor, "business", r"business_core.csv")
+
+# Now load tables with relationships.
+
+load_table(cnx, cursor, "review", r"review_core.csv")
+load_table(cnx, cursor, "high_count_review", r"high_count_review.csv")
+load_table(cnx, cursor, "user_friend", r"user_friend.csv")
+
+# The indicator tables just need rows for false (0) and true (1).
+cmd = "INSERT INTO %s (val) VALUE (0); INSERT INTO after (val) VALUE (1);"
+try:
+    cursor.execute(cmd % "after")
+    cursor.execute(cmd % "friend")
+    cnx.commit()
+except mysql.connector.Error as err:
+    print "Insert into indicator table failed:\n%s" % err
+    cnx.close()
+    sys.exit(1)
+```
+
+```{python compute_friend_statistics, echo=FALSE}
+# Execute the statistics query on reviews, one batch at a time.
+
+import my_cnf
+import mysql.connector
+import os.path
+import simplejson as json
+import sys
+# import time
+
+data_dir = "data"
+high_count_review_key_ranges = "high_count_review_key_ranges.json"
+
+key_ranges = []
+with open(os.path.join(data_dir, high_count_review_key_ranges), "rb") as key_ranges_json:
+    key_ranges = json.load(key_ranges_json)
+
+# Command to compute average and standard deviation of review ratings, and
+# count of reviews, for friends, non-friends and before, after each high
+# count review.  Since a user is not their own friend, they must be explicitly
+# excluded from the non-friends case, else the very review that this sample
+# concerns will be included.
+# The range of review keys for each batch will be inserted into the command.
+# Note the IGNORE -- this means duplicate keys will be dropped without
+# aborting the command.  There *are* duplicates, since a user may review
+# a business multiple times.  With IGMORE, second and later duplicates
+# will be ignored, and -- the documentation claims -- instead add a warning.
+# Unfortunately, no warnings are returned.
+cmd = """
+INSERT IGNORE INTO friend_review_statistics
+SELECT high_count_review.business_key AS hcr_business_key,
+high_count_review.user_key AS hcr_user_key,
+friend.val AS is_friend,
+after.val AS is_after,
+high_count_review.stars AS hcr_stars,
+high_count_review.date AS hcr_date,
+COUNT(*) AS review_count,
+AVG(review.stars) AS avg_review_stars,
+STD(review.stars) AS std_review_stars
+FROM high_count_review, review, friend, after
+WHERE high_count_review.review_key BETWEEN %s AND %s
+AND high_count_review.business_key = review.business_key
+AND high_count_review.user_key != review.user_key
+AND (review.user_key IN (
+SELECT user_friend.friend_key FROM user_friend
+WHERE user_friend.user_key = high_count_review.user_key
+)) = friend.val
+AND (review.date > high_count_review.date) = after.val
+GROUP BY hcr_business_key, hcr_user_key, is_friend, is_after;
+"""
+
+# Open a connection as the database user.
+db_option_group = "client%s" % my_cnf.database
+try:
+    cnx = mysql.connector.connect(option_files="my.cnf",
+                                  option_groups=db_option_group,
+                                  database=my_cnf.database,
+                                  raise_on_warnings=False,
+                                  get_warnings=True)
+    cursor = cnx.cursor()
+except mysql.connector.Error as err:
+    print "Connect to MySQL server as db user failed:\n%s" % err
+    sys.exit(1)
+
+# Check if the table is already populated, and quit if so.
+cmd = "SELECT COUNT(*) FROM friend_review_statistics;"
+count = 0
+try:
+    cursor.execute(cmd)
+    count = cursor.fetchone()[0]
+except mysql.connector.Error as err:
+    print "Select count(*) failed:\n%s" % err
+    sys.exit(1)
+if count > 0:
+    sys.exit(0)
+    
+# Would like to see if this is making progress, and have an idea of how long it
+# will take.  However, messages would go into the document.  I've left the
+# print statements in, commented out, but they'd need to be replaced by
+# something that would write a message to the RStudio console rather than into
+# the document.
+
+# print "%s, start" % time.strftime("%Y-%m-%d:%H:%M:%S", time.localtime())
+
+for key_range in key_ranges:
+    # Cannot just supply the pair key_range as the argument of %, as that would
+    # be ambiguous.
+    range_cmd = cmd % (key_range[0], key_range[1])
+    try:
+        result = cursor.execute(range_cmd)
+        cnx.commit()
+    except mysql.connector.Error as err:
+        print "Insert into friend_review_statistics for range %s failed:\n%s" % (key_range, err)
+        cnx.close()
+        sys.exit(1)
+    # print "%s, at end of %s" % (time.strftime("%Y-%m-%d:%H:%M:%S", time.localtime()), key_range)
+
+# print "%s, end" % time.strftime("%Y-%m-%d:%H:%M:%S", time.localtime())
+cnx.close()
+```
+
+``` {python compute_friend_statistics_split_dates, echo=FALSE}
+
+# Repeat the above, but split into before and after the Yelp site redesign.
+
+import my_cnf
+import mysql.connector
+import os.path
+import simplejson as json
+import sys
+# import time
+
+data_dir = "data"
+high_count_review_key_ranges = "high_count_review_key_ranges.json"
+
+YELP_SITE_REDESIGN_DATE = "2014-02-11"
+
+key_ranges = []
+with open(os.path.join(data_dir, high_count_review_key_ranges), "rb") as key_ranges_json:
+    key_ranges = json.load(key_ranges_json)
+
+# Command to compute average and standard deviation of review ratings, and
+# count of reviews, for friends, non-friends and before, after each high
+# count review.  Since a user is not their own friend, they must be explicitly
+# excluded from the non-friends case, else the very review that this sample
+# concerns will be included.
+# The range of review keys for each batch will be inserted into the command.
+# Note the IGNORE -- this means duplicate keys will be dropped without
+# aborting the command.  There *are* duplicates, since a user may review
+# a business multiple times.  With IGMORE, second and later duplicates
+# will be ignored, and -- the documentation claims -- instead add a warning.
+# Unfortunately, no warnings are returned.
+cmd = """
+INSERT IGNORE INTO friend_review_statistics_%(version)s
+SELECT high_count_review.business_key AS hcr_business_key,
+high_count_review.user_key AS hcr_user_key,
+friend.val AS is_friend,
+after.val AS is_after,
+high_count_review.stars AS hcr_stars,
+high_count_review.date AS hcr_date,
+COUNT(*) AS review_count,
+AVG(review.stars) AS avg_review_stars,
+STD(review.stars) AS std_review_stars
+FROM high_count_review, review, friend, after
+WHERE review.date %(date_op)s '%(change_date)s'
+AND high_count_review.date %(date_op)s '%(change_date)s'
+AND high_count_review.review_key BETWEEN %(key_first)s AND %(key_last)s
+AND high_count_review.business_key = review.business_key
+AND high_count_review.user_key != review.user_key
+AND (review.user_key IN (
+SELECT user_friend.friend_key FROM user_friend
+WHERE user_friend.user_key = high_count_review.user_key
+)) = friend.val
+AND (review.date > high_count_review.date) = after.val
+GROUP BY hcr_business_key, hcr_user_key, is_friend, is_after;
+"""
+
+def do_friend_query(key_range, version, date_op):
+    range_cmd = cmd % {
+        "key_first": key_range[0],
+        "key_last": key_range[1],
+        "change_date": YELP_SITE_REDESIGN_DATE,
+        "version": version,
+        "date_op": date_op,
+        }
+    try:
+        result = cursor.execute(range_cmd)
+        cnx.commit()
+    except mysql.connector.Error as err:
+        print "Insert into friend_review_statistics_%s for range %s failed:\n%s" % (version, key_range, err)
+        cnx.close()
+        sys.exit(1)
+
+# Open a connection as the database user.
+db_option_group = "client%s" % my_cnf.database
+try:
+    cnx = mysql.connector.connect(option_files="my.cnf",
+                                  option_groups=db_option_group,
+                                  database=my_cnf.database,
+                                  raise_on_warnings=False,
+                                  get_warnings=True)
+    cursor = cnx.cursor()
+except mysql.connector.Error as err:
+    print "Connect to MySQL server as db user failed:\n%s" % err
+    sys.exit(1)
+
+# Check if the tables are already populated, and quit if so.
+# We're only checking one, but both are written here, so they should
+# succeed or fail together.
+cmd = "SELECT COUNT(*) FROM friend_review_statistics_post;"
+count = 0
+try:
+    cursor.execute(cmd)
+    count = cursor.fetchone()[0]
+except mysql.connector.Error as err:
+    print "Select count(*) failed:\n%s" % err
+    sys.exit(1)
+if count > 0:
+    sys.exit(0)
+
+# As before, the progress messages are commented out.
+# print "%s, start" % time.strftime("%Y-%m-%d:%H:%M:%S", time.localtime())
+
+for key_range in key_ranges:
+    do_friend_query(key_range, "pre", "<")
+    do_friend_query(key_range, "post", ">=")
+    # print "%s, at end of %s" % (time.strftime("%Y-%m-%d:%H:%M:%S", time.localtime()), key_range)
+
+# print "%s, end" % time.strftime("%Y-%m-%d:%H:%M:%S", time.localtime())
+cnx.close()
+```
+
+```{python join_cases, echo=FALSE}
+
+# We have the friend statistics in a "narrow" table with each of the four
+# friend / after cases in a separate row.  Next need to bring those together
+# onto the same row.  Select out each case into its own table, then join those
+# on the business and user keys.  Not all cases exist for every business /
+# user -- we only want full rows, so won't do an outer join.  Make these
+# real tables, not temporary, in case we need to re-run this.  But we can drop
+# them later.
+
+# @ToDo: Retrofit older code to use these helpers.
+from sql_utilities import connect_as_db_user, is_table_empty, populate_table
+import sys
+
+# Open a connection as the database user.
+cnx, cursor = connect_as_db_user()
+
+# Check if the tables are already populated, and quit if so.
+# Check just the main result table.
+if not is_table_empty("friend_review_statistics_all_cases"):
+    sys.exit(0)
+
+case_table = "friend_review_statistics_%(friend)s_%(after)s"
+
+insert_case = """
+INSERT INTO friend_review_statistics_%(friend)s_%(after)s
+SELECT business_key, user_key,
+stars,
+review_count,
+avg_review_stars,
+std_review_stars
+FROM friend_review_statistics
+WHERE is_friend = %(friend)s AND is_after = %(after)s
+"""
+
+join_cases = """
+INSERT INTO friend_review_statistics_all_cases
+SELECT
+s00.business_key,
+s00.user_key,
+s00.stars AS reference_stars,
+s00.review_count AS review_count_0_0,
+s00.avg_review_stars AS avg_review_stars_0_0,
+s00.std_review_stars AS std_review_stars_0_0,
+s01.review_count AS review_count_0_1,
+s01.avg_review_stars AS avg_review_stars_0_1,
+s01.std_review_stars AS std_review_stars_0_1,
+s10.review_count AS review_count_1_0,
+s10.avg_review_stars AS avg_review_stars_1_0,
+s10.std_review_stars AS std_review_stars_1_0,
+s11.review_count AS review_count_1_1,
+s11.avg_review_stars AS avg_review_stars_1_1,
+s11.std_review_stars AS std_review_stars_1_1
+FROM
+friend_review_statistics_0_0 as s00,
+friend_review_statistics_0_1 as s01,
+friend_review_statistics_1_0 as s10,
+friend_review_statistics_1_1 as s11
+WHERE
+s00.business_key = s01.business_key
+AND s00.business_key = s10.business_key
+AND s00.business_key = s11.business_key
+AND s00.user_key = s01.user_key
+AND s00.user_key = s10.user_key
+AND s00.user_key = s11.user_key;
+"""
+
+# Populate the separate case tables.
+for friend, after in [(0,0), (0,1), (1,0), (1,1)]:
+    case = {"friend": friend, "after": after}
+    insert_case_cmd = insert_case % case
+    populate_table(cnx, cursor, case_table % case, insert_case_cmd)
+ 
+# Join the case tables.
+populate_table(cnx, cursor, "friend_review_statistics_all_cases", join_cases)
+
+cnx.close()
+```
+
+```{python join_cases_split_dates, echo=FALSE}
 ```
 
 ## Methods and Data

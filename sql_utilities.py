@@ -2,6 +2,7 @@
 
 import my_cnf
 import mysql.connector
+import sys
 import unicodecsv as csv
 
 def connect_as_db_user():
@@ -19,8 +20,26 @@ def connect_as_db_user():
         cursor = cnx.cursor()
     except mysql.connector.Error as err:
         print "Connect to MySQL server as db user failed:\n%s" % err
-        exit(1)
+        sys.exit(1)
     return (cnx, cursor)
+
+def is_table_empty(cnx, cursor, table):
+    """
+    Return True if the given table is empty.
+    Use this to check if a table has been populated, to avoid re-running
+    the query that populated it.
+    """
+
+    cmd = "SELECT COUNT(*) FROM %s;" % table
+    count = 0
+    try:
+        cursor.execute(cmd)
+        count = cursor.fetchone()[0]
+    except mysql.connector.Error as err:
+        print "Select count(*) failed:\n%s" % err
+        sys.exit(1)
+    return count == 0
+
 
 def do_modify(cnx, cursor, cmd):
     """
@@ -36,7 +55,7 @@ def do_modify(cnx, cursor, cmd):
     except mysql.connector.Error as err:
         print "Query failed:\n%s\n%s" % (cmd, err)
         cnx.close()
-        exit(1)
+        sys.exit(1)
     # The warnings do not seem to be returned, even in cases when warnings
     # are known to occur.
     return (exec_warnings, commit_warnings)
@@ -53,7 +72,7 @@ def do_select(cnx, cursor, cmd, csv_file=None, csv_headers=None):
     except mysql.connector.Error as err:
         print "Query failed:\n%s\n%s" % (cmd, err)
         cnx.close()
-        exit(1)
+        sys.exit(1)
 
     rows = cursor.fetchall()
 
@@ -82,7 +101,7 @@ def do_cmd(cnx, cursor, cmd, commit=False):
     except mysql.connector.Error as err:
         print "Query failed:\n%s\n%s" % (cmd, err)
         cnx.close()
-        exit(1)
+        sys.exit(1)
 
 def populate_table(cnx, cursor, table, cmd, verbose=False):
     """
@@ -92,15 +111,7 @@ def populate_table(cnx, cursor, table, cmd, verbose=False):
     """
 
     # First check if this table is populated.
-    count_cmd = "SELECT COUNT(*) FROM %s;" % table
-    count = 0
-    try:
-        cursor.execute(count_cmd)
-        count = cursor.fetchone()[0]
-    except mysql.connector.Error as err:
-        print "Select count(*) failed:\n%s" % err
-        exit(1)
-    if count > 0:
+    if not is_table_empty(table):
         if verbose:
             print "Table %s already contains data." % table
         return

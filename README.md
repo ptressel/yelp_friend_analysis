@@ -12,7 +12,7 @@ Here, there's an unholy mixture of bash, Python, SQL, and R.
 If you would like to run this code, you'll need the following:
 
 * R and RStudio
-* MySQL, preferably at least v 5.7
+* MySQL, preferably at least v 5.7, and the Python-MySQL connector (both from Oracle)
 * Python 2.7
 * Assorted R and Python packages, which will announce their lack by causing the code to fail,
   at which point, you can install them.
@@ -31,6 +31,7 @@ To run this:
   put*username*here. In the [client] section, you'll need your actual MySQL root password. In the
   [clientjhu_datasci_capstone_yelp] section, pick a username and password for this project's
   database, which will be called jhu_datasci_capstone_yelp.
+* Start the MySQL server with the option local_infile=1 (see comments in the Rmd file about this).
 * In RStudio, set the working directory to the repository.
 * Open yelp_friend_analysis_report.Rmd
 * Poke knit to PDF.
