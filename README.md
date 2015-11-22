@@ -36,5 +36,6 @@ To run this:
 * Open yelp_friend_analysis_report.Rmd
 * Poke knit to PDF.
 
-NOTE: This is not yet quite ready to run -- I'm in the process of converting all the 30-some scripts into
-code chunks in the Rmd file, taking out Windows-specific paths, etc.
+NOTE: All of the former stand-alone scripts have been converted to code chunks in the Rmd file.
+Next step is testing to make sure nothing broke during conversion. Re-running the entire process
+from the ground up will take about a day.
