@@ -299,6 +299,358 @@ with open(os.path.join(data_dir, review_file), "rb") as review, \
                 row["date"],
             ])
 ```
+
+```{python high_count_review, echo=FALSE}
+
+# This supports splitting the longest query up into batches. For this, we
+# need ranges of review keys that contain about the same number of rows
+# per batch. This query will run over only the reviews for users with lots
+# of friends, and businesses with lots of reviews, so it's only those reviews
+# that we want to count when splitting into batches.
+#
+# The MySQL query optimizer refuses to extract reviews in order of the review
+# primary key when joined to the user table to check the user's friend count.
+# It insists on going through the user table first.  That will perform the
+# inserts into the high_count_review table in a jumbled order, not in order
+# of its primary key index.  So when computations are later done in batches
+# of contiguous primary keys, the disk accesses will thrash.  Better to get
+# the table rows written to disk in order by the primary key, in hope that
+# they will be contiguous, so accesses in order by primary key will be fast.
+# Since MySQL won't do it, we'll do that here, by re-reading the review CSV
+# file, and filtering it on user friend count.  To do that, we'll read back
+# in the user table and make a set with high-friend-count users.
+
+import os.path
+import sys
+
+data_dir = "data"
+review_core = "review_core.csv"
+user_core = "user_core.csv"
+high_count_review = "high_count_review.csv"
+
+# Check whether we have already created the files produced by this chunk,
+# and exit if so.
+if os.path.exists(os.path.join(data_dir, high_count_review)):
+    sys.exit(0)
+
+import unicodecsv as csv
+
+MIN_FRIEND_COUNT = 50
+
+high_friend_users = set()
+
+with open("data\\user_core.csv", "rb") as user_csv:
+    reader = csv.reader(user_csv, delimiter=";")
+    # Read the headers.
+    headers = reader.next()
+    # The user_key is at index 0, and the friend_count is at 1, but get them
+    # programmatically.
+    user_key_idx = headers.index("user_key")
+    friend_count_idx = headers.index("friend_count")
+    for row in reader:
+        if int(row[friend_count_idx]) >= MIN_FRIEND_COUNT:
+            high_friend_users.add(int(row[user_key_idx]))
+
+# Now we have our user_key filter.  Scan the reviews and write out the ones
+# with the high-friend users.  Reviews have already been restricted to
+# businesses with high review counts.
+
+with open(os.path.join(data_dir, review_core), "rb") as review_csv, \
+     open(os.path.join(data_dir, high_count_review), "wb") as high_count_csv:
+    reader = csv.reader(review_csv, delimiter=";")
+    writer = csv.writer(high_count_csv, delimiter=";")
+    # Read the headers.
+    headers = reader.next()
+    # Write the same.
+    writer.writerow(headers)
+    # Get index for user_key.
+    user_key_idx = headers.index("user_key")
+    for row in reader:
+        if int(row[user_key_idx]) in high_friend_users:
+            writer.writerow(row)
+```
+
+```{python create_database, echo=FALSE}
+
+# This creates the database and the main tables.  If a table exists, it is not
+# re-created, so if, during development, the schema is changed, alter the
+# schema and update this file so it matches the new schema.
+
+import my_cnf
+import mysql.connector
+import sys
+
+# Open a connection to the database using the root user.  For normal operation
+# once the database exists, we'll use the database user.  During development,
+# can set raise_on_warnings to get an exception when there is a warning.  But
+# note that this will fail if the database already exists if raise_on_warnings
+# is True.
+raise_on_warnings=False
+try:
+    cnx = mysql.connector.connect(option_files="my.cnf", option_groups="client",
+                                  raise_on_warnings=raise_on_warnings)
+    cursor = cnx.cursor()
+except mysql.connector.Error as err:
+    print "Initial connect to MySQL server failed:\n%s" % err
+    sys.exit(1)
+
+# First, create the database and its user.  Note use of utf8mb4, which will be
+# in effect for all tables.
+create_database = """
+CREATE DATABASE IF NOT EXISTS %s CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+""" % my_cnf.database
+try:
+    cursor.execute(create_database)
+except mysql.connector.Error as err:
+    print "Create database failed:\n%s" % err
+    sys.exit(1)
+
+# Now add the database user.  This should be ok even if it has been done before.
+# Note under MySQL 5.7 (and probably later), NO_AUTO_CREATE_USER is in the
+# default SQL mode, so the CREATE USER command is needed.
+# FILE permission would be needed to be able to write data out in a file
+# directly from MySQL, but allowing the db user to do this would also require
+# turning off the secure-file-priv option for the MySQL server.  Don't want to
+# ask anyone running these scripts to do that.  So, read the data in Python
+# and write it out from there.
+# create_db_user = """
+# CREATE USER '%(user)s'@'localhost' IDENTIFIED BY '%(pwd)s';
+# GRANT ALL ON %(database)s.* to '%(user)s'@'localhost';
+# GRANT FILE ON *.* TO '%(user)s'@'localhost';
+# FLUSH PRIVILEGES;
+# """ % dict(user=my_cnf.db_user, pwd=my_cnf.db_pwd, database=my_cnf.database)
+create_db_user = """
+CREATE USER '%(user)s'@'localhost' IDENTIFIED BY '%(pwd)s';
+GRANT ALL ON %(database)s.* to '%(user)s'@'localhost';
+FLUSH PRIVILEGES;
+""" % dict(user=my_cnf.db_user, pwd=my_cnf.db_pwd, database=my_cnf.database)
+try:
+    cursor.execute(create_db_user, multi=True)
+except mysql.connector.Error as err:
+    print "Create database user failed:\n%s" % err
+    sys.exit(1)
+
+# Commit and close the connection.
+try:
+    cnx.commit()
+    cnx.close()
+except mysql.connector.Error as err:
+    print "Commit of database and user setup failed:\n%s" % err
+    sys.exit(1)
+
+# Open a connection with the database user.
+db_option_group = "client%s" % my_cnf.database
+try:
+    cnx = mysql.connector.connect(option_files="my.cnf",
+                                  option_groups=db_option_group,
+                                  database=my_cnf.database,
+                                  raise_on_warnings=raise_on_warnings)
+    cursor = cnx.cursor()
+except mysql.connector.Error as err:
+    print "Connect to MySQL server as db user failed:\n%s" % err
+    sys.exit(1)
+
+# Table schemas.
+
+# Business table
+business_schema = """
+CREATE TABLE IF NOT EXISTS business (
+business_key SMALLINT UNSIGNED NOT NULL,
+review_count SMALLINT UNSIGNED DEFAULT 0,
+PRIMARY KEY (business_key),
+INDEX business_review_count_idx (review_count)
+)
+ENGINE InnoDB;
+"""
+
+# User table
+user_schema = """
+CREATE TABLE IF NOT EXISTS user (
+user_key MEDIUMINT UNSIGNED NOT NULL,
+friend_count SMALLINT UNSIGNED DEFAULT 0,
+PRIMARY KEY (user_key),
+INDEX user_friend_count_idx (friend_count)
+)
+ENGINE InnoDB;
+"""
+
+# Review table and high-count review table. Note %(table)s for table name.
+review_schema = """
+CREATE TABLE IF NOT EXISTS %(table)s (
+review_key MEDIUMINT UNSIGNED NOT NULL,
+business_key SMALLINT UNSIGNED NOT NULL,
+user_key MEDIUMINT UNSIGNED NOT NULL,
+stars TINYINT UNSIGNED DEFAULT 0,
+date DATE,
+PRIMARY KEY (review_key),
+INDEX business_key_idx (business_key),
+INDEX user_key_idx (user_key),
+INDEX %(table)s_date_idx (date),
+CONSTRAINT review_business_fk FOREIGN KEY (business_key) REFERENCES business (business_key) ON DELETE CASCADE,
+CONSTRAINT review_user_fk FOREIGN KEY (user_key) REFERENCES user (user_key) ON DELETE CASCADE
+)
+ENGINE InnoDB;
+"""
+
+# The user-friend relationship.
+user_friend_schema = """
+CREATE TABLE IF NOT EXISTS user_friend (
+user_key MEDIUMINT UNSIGNED NOT NULL,
+friend_key MEDIUMINT UNSIGNED NOT NULL,
+PRIMARY KEY (user_key, friend_key),
+CONSTRAINT user_friend_user_fk FOREIGN KEY (user_key) REFERENCES user (user_key) ON DELETE CASCADE,
+CONSTRAINT user_friend_friend_fk FOREIGN KEY (friend_key) REFERENCES user (user_key) ON DELETE CASCADE
+)
+ENGINE=InnoDB;
+"""
+
+# These tables hold a boolean indicator value to specify whether a predicate
+# in a query should be true or false.  These can be used in a GROUP BY to
+# split the query into sets for each state of the indicator.  This serves in
+# place of such language features as loops.  After many attempts at alternate
+# forms of queries, only this managed to combine all cases in one query.
+
+# Indicator for date before and after a given date.
+after_schema = """
+CREATE TABLE IF NOT EXISTS after (
+val BOOLEAN
+)
+ENGINE=InnoDB;
+"""
+
+# Indicator for selecting friend versus non-friend.
+friend_schema = """
+CREATE TABLE IF NOT EXISTS friend (
+val BOOLEAN
+)
+ENGINE=InnoDB;
+"""
+
+# The statistics on friend vs. non-friend, before vs. after reviews.
+# Used for three tables.
+friend_review_statistics_table = "friend_review_statistics%(underscore_version)s"
+friend_review_statistics_schema = """
+CREATE TABLE IF NOT EXISTS friend_review_statistics%(underscore_version)s (
+business_key SMALLINT UNSIGNED NOT NULL,
+user_key MEDIUMINT UNSIGNED NOT NULL,
+is_friend BOOLEAN,
+is_after BOOLEAN,
+stars TINYINT UNSIGNED DEFAULT 0,
+date DATE,
+review_count SMALLINT UNSIGNED,
+avg_review_stars FLOAT,
+std_review_stars FLOAT,
+PRIMARY KEY (business_key, user_key, is_friend, is_after),
+INDEX statistics%(underscore_version)s_date_idx (date),
+CONSTRAINT statistics%(underscore_version)s_business_fk FOREIGN KEY (business_key) REFERENCES business (business_key) ON DELETE CASCADE,
+CONSTRAINT statistics%(underscore_version)s_user_fk FOREIGN KEY (user_key) REFERENCES user (user_key) ON DELETE CASCADE
+)
+ENGINE=InnoDB;
+"""
+
+case_table = "friend_review_statistics%(underscore_version)s_%(friend)s_%(after)s"
+case_schema = """
+CREATE TABLE IF NOT EXISTS friend_review_statistics%(underscore_version)s_%(friend)s_%(after)s (
+business_key SMALLINT UNSIGNED NOT NULL,
+user_key MEDIUMINT UNSIGNED NOT NULL,
+stars TINYINT UNSIGNED DEFAULT 0,
+review_count SMALLINT UNSIGNED,
+avg_review_stars FLOAT,
+std_review_stars FLOAT,
+PRIMARY KEY (business_key, user_key),
+CONSTRAINT statistics%(underscore_version)s_%(friend)s_%(after)s_business_fk FOREIGN KEY (business_key) REFERENCES business (business_key) ON DELETE CASCADE,
+CONSTRAINT statistics%(underscore_version)s_%(friend)s_%(after)s_user_fk FOREIGN KEY (user_key) REFERENCES user (user_key) ON DELETE CASCADE
+)
+ENGINE=InnoDB;
+"""
+
+all_cases_table = "friend_review_statistics%(underscore_version)s_all_cases"
+all_cases_schema = """
+CREATE TABLE IF NOT EXISTS friend_review_statistics%(underscore_version)s_all_cases (
+business_key SMALLINT UNSIGNED NOT NULL,
+user_key MEDIUMINT UNSIGNED NOT NULL,
+reference_stars TINYINT UNSIGNED DEFAULT 0,
+review_count_0_0 SMALLINT UNSIGNED,
+avg_review_stars_0_0 FLOAT,
+std_review_stars_0_0 FLOAT,
+review_count_0_1 SMALLINT UNSIGNED,
+avg_review_stars_0_1 FLOAT,
+std_review_stars_0_1 FLOAT,
+review_count_1_0 SMALLINT UNSIGNED,
+avg_review_stars_1_0 FLOAT,
+std_review_stars_1_0 FLOAT,
+review_count_1_1 SMALLINT UNSIGNED,
+avg_review_stars_1_1 FLOAT,
+std_review_stars_1_1 FLOAT,
+PRIMARY KEY (business_key, user_key),
+CONSTRAINT statistics%(underscore_version)s_all_cases_business_fk FOREIGN KEY (business_key) REFERENCES business (business_key) ON DELETE CASCADE,
+CONSTRAINT statistics%(underscore_version)s_all_cases_user_fk FOREIGN KEY (user_key) REFERENCES user (user_key) ON DELETE CASCADE
+)
+ENGINE=InnoDB;
+"""
+
+per_business_stars_schema = """
+CREATE TABLE IF NOT EXISTS per_business_stars (
+business_key SMALLINT UNSIGNED NOT NULL,
+star_1 FLOAT DEFAULT 0.0,
+star_2 FLOAT DEFAULT 0.0,
+star_3 FLOAT DEFAULT 0.0,
+star_4 FLOAT DEFAULT 0.0,
+star_5 FLOAT DEFAULT 0.0,
+avg_review_stars FLOAT DEFAULT 0.0,
+PRIMARY KEY (business_key)
+)
+ENGINE=InnoDB;
+"""
+
+def create_table(cnx, cursor, table, cmd):
+    """
+    Add and commit the table specified by a create table command in cmd.
+    The table name argument is only used for error messages.
+    """
+    try:
+        cursor.execute(cmd)
+        cnx.commit()
+    except mysql.connector.Error as err:
+        print "Create %s table failed:\n%s" % (table, err)
+        cnx.close()
+        sys.exit(1)
+
+# Add and commit each table one at a time.
+create_table(cnx, cursor, "business", business_schema)
+create_table(cnx, cursor, "user", user_schema)
+create_table(cnx, cursor, "review", review_schema % {"table": "review"})
+create_table(cnx, cursor, "high_count_review", review_schema % {"table": "high_count_review"})
+create_table(cnx, cursor, "user_friend", user_friend_schema)
+create_table(cnx, cursor, "after", after_schema)
+create_table(cnx, cursor, "friend", friend_schema)
+create_table(cnx, cursor, "per_business_stars", per_business_stars_schema)
+
+# Create the all-dates tables and the tables split at the Yelp site redesign.
+for underscore_version in ("", "_pre", "_post"):
+    name = {"underscore_version": underscore_version}
+    # Create the "narrow" table with cases in separate rows.
+    create_table(cnx, cursor,
+                 friend_review_statistics_table % name,
+                 friend_review_statistics_schema % name)
+    # Create the "wide" table with all cases in a row.
+    create_table(cnx, cursor, all_cases_table % name, all_cases_schema % name)
+    # Create the separated case tables.
+    for friend in (0, 1):
+        for after in (0, 1):
+            case = {"underscore_version": underscore_version, "friend": friend, "after": after}
+            case_table_name = case_table % case
+            create_case_table_cmd = case_schema % case
+            create_table(cnx, cursor, case_table_name, create_case_table_cmd)
+
+# Done with setup -- close.
+try:
+    cnx.close()
+except mysql.connector.Error as err:
+    print "Close of db user connection failed:\n%s" % err
+    sys.exit(1)
+```
+
 ## Methods and Data
 
 ### Overview and terminology
