@@ -1153,6 +1153,186 @@ cnx.close()
 ```
 
 ```{python join_cases_split_dates, echo=FALSE}
+
+# Repeat the step of joining the four cases for the pre and post site
+# reorganization tables.
+
+from sql_utilities import connect_as_db_user, is_table_empty, populate_table
+import sys
+
+# Open a connection as the database user.
+cnx, cursor = connect_as_db_user()
+
+# Check if the tables are already populated, and quit if so.
+# Check just the main result table.
+if not is_table_empty("friend_review_statistics_post_all_cases"):
+    sys.exit(0)
+
+case_table = "friend_review_statistics_%(version)s_%(friend)s_%(after)s"
+
+insert_case = """
+INSERT INTO friend_review_statistics_%(version)s_%(friend)s_%(after)s
+SELECT business_key, user_key,
+stars,
+review_count,
+avg_review_stars,
+std_review_stars
+FROM friend_review_statistics_%(version)s
+WHERE is_friend = %(friend)s AND is_after = %(after)s
+"""
+
+join_table = "friend_review_statistics_%(version)s_all_cases"
+join_cases = """
+INSERT INTO friend_review_statistics_%(version)s_all_cases
+SELECT
+s00.business_key,
+s00.user_key,
+s00.stars AS reference_stars,
+s00.review_count AS review_count_0_0,
+s00.avg_review_stars AS avg_review_stars_0_0,
+s00.std_review_stars AS std_review_stars_0_0,
+s01.review_count AS review_count_0_1,
+s01.avg_review_stars AS avg_review_stars_0_1,
+s01.std_review_stars AS std_review_stars_0_1,
+s10.review_count AS review_count_1_0,
+s10.avg_review_stars AS avg_review_stars_1_0,
+s10.std_review_stars AS std_review_stars_1_0,
+s11.review_count AS review_count_1_1,
+s11.avg_review_stars AS avg_review_stars_1_1,
+s11.std_review_stars AS std_review_stars_1_1
+FROM
+friend_review_statistics_%(version)s_0_0 as s00,
+friend_review_statistics_%(version)s_0_1 as s01,
+friend_review_statistics_%(version)s_1_0 as s10,
+friend_review_statistics_%(version)s_1_1 as s11
+WHERE
+s00.business_key = s01.business_key
+AND s00.business_key = s10.business_key
+AND s00.business_key = s11.business_key
+AND s00.user_key = s01.user_key
+AND s00.user_key = s10.user_key
+AND s00.user_key = s11.user_key;
+"""
+
+for version in ("pre", "post"):
+    # Populate the separate case tables.
+    for friend in (0, 1):
+        for after in (0, 1):
+            case = {"version": version, "friend": friend, "after": after}
+            populate_table(cnx, cursor, case_table % case, insert_case % case)
+ 
+    # Join the case tables.
+    name = {"version": version}
+    populate_table(cnx, cursor, join_table % name, join_cases % name)
+
+cnx.close()
+```
+
+```{python extract_friend_statistics, echo=FALSE}
+
+# Extract the data for the friend investigation, so it can be loaded into R.
+# The business and user keys are no longer relevant -- they were only required
+# to perform the aggregation.  Likewise the date is not needed, since we've
+# grouped by before and after.
+
+import os.path
+import sys
+import time
+# See comment before commented-out code re. why we can't have MySQL write out
+# the file directly.
+# from sql_utilities import connect_as_db_user, do_cmd
+from sql_utilities import connect_as_db_user, do_select
+
+data_dir = "data"
+friend_review_statistics = "friend_review_statistics_rc_ge_3.csv"
+csv_file = os.path.join(data_dir, friend_review_statistics)
+
+# Check whether we have already created the files produced by this chunk,
+# and exit if so.
+if os.path.exists(csv_file):
+    sys.exit(0)
+
+# Open a connection as the database user.
+cnx, cursor = connect_as_db_user()
+
+
+# So, instead, read the data through Python.  This is a wasted hop, but is
+# safer and less worry for anyone running this, as this process will run as
+# the user's own account, and have their own file permissions.
+csv_header = [
+"reference_stars", 
+"review_count_0_0", "avg_review_stars_0_0", "std_review_stars_0_0",
+"review_count_0_1", "avg_review_stars_0_1", "std_review_stars_0_1",
+"review_count_1_0", "avg_review_stars_1_0", "std_review_stars_1_0",
+"review_count_1_1", "avg_review_stars_1_1", "std_review_stars_1_1"
+]
+cmd = r"""
+SELECT
+reference_stars, 
+review_count_0_0, avg_review_stars_0_0, std_review_stars_0_0,
+review_count_0_1, avg_review_stars_0_1, std_review_stars_0_1,
+review_count_1_0, avg_review_stars_1_0, std_review_stars_1_0,
+review_count_1_1, avg_review_stars_1_1, std_review_stars_1_1
+FROM friend_review_statistics_all_cases
+WHERE review_count_0_0 >= 3
+AND review_count_0_1 >= 3
+AND review_count_1_0 >= 3
+AND review_count_1_1 >= 3;
+"""
+do_select(cnx, cursor, cmd, csv_file, csv_header)
+
+cnx.close()
+```
+
+```{python extract_friend_statistics_split_dates, echo=FALSE}
+
+# Repeat extracting the friend statistics for the pre and post site
+# reorganization data.
+
+import os.path
+import sys
+import time
+# See comment before commented-out code re. why we can't have MySQL write out
+# the file directly.
+# from sql_utilities import connect_as_db_user, do_cmd
+from sql_utilities import connect_as_db_user, do_select
+
+# Open a connection as the database user.
+cnx, cursor = connect_as_db_user()
+
+data_dir = "data"
+friend_review_statistics_split = "friend_review_statistics_%s_rc_ge_3.csv"
+csv_file = os.path.join(data_dir, friend_review_statistics_split)
+
+# Check whether we have already created the files produced by this chunk,
+# and exit if so. Check only one of the files.
+if os.path.exists(csv_file % "post"):
+    sys.exit(0)
+
+csv_header = [
+"reference_stars", 
+"review_count_0_0", "avg_review_stars_0_0", "std_review_stars_0_0",
+"review_count_0_1", "avg_review_stars_0_1", "std_review_stars_0_1",
+"review_count_1_0", "avg_review_stars_1_0", "std_review_stars_1_0",
+"review_count_1_1", "avg_review_stars_1_1", "std_review_stars_1_1"
+]
+cmd = r"""
+SELECT
+reference_stars, 
+review_count_0_0, avg_review_stars_0_0, std_review_stars_0_0,
+review_count_0_1, avg_review_stars_0_1, std_review_stars_0_1,
+review_count_1_0, avg_review_stars_1_0, std_review_stars_1_0,
+review_count_1_1, avg_review_stars_1_1, std_review_stars_1_1
+FROM friend_review_statistics_%s_all_cases
+WHERE review_count_0_0 >= 3
+AND review_count_0_1 >= 3
+AND review_count_1_0 >= 3
+AND review_count_1_1 >= 3;
+"""
+do_select(cnx, cursor, cmd % "pre", csv_file % "pre", csv_header)
+do_select(cnx, cursor, cmd % "post", csv_file % "post", csv_header)
+
+cnx.close()
 ```
 
 ## Methods and Data
