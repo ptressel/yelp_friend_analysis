@@ -1,0 +1,120 @@
+Do Yelp Friends Influence Reviews?
+========================================================
+author: Patricia Tressel
+date: November 18, 2015
+height: 900
+width: 1400
+
+Yelp has friends?
+========================================================
+
+- Social media (e.g. Facebook) friends are central to site
+- Yelp core purpose: Rating and finding businesses
+- Friend relationship not obviously relevant to Yelp
+
+Question: ***Do Yelp friends influence review ratings?***
+
+- When a user posts a review, are later friend reviews swayed?
+- But what if the business has actually changed?
+- Yelp Challenge Data has friends, review ratings & dates
+- How can we use that to try to answer the question?
+
+Note:
+
+- 2014 Yelp site redesign made friend reviews less visible
+- Results here are for the current site design
+
+Answering the question
+========================================================
+
+How can we distinguish...
+
+- *Influence of a user's review* on friends' later reviews
+- *Actual change in a business's quality* that affects reviews
+
+***Use non-friend reviews as a control group!*** Compare:
+
+- Shift in ratings of a business before and after a user's review
+- Look for a shift in the same direction as the user's review
+- Do this separately for friends and non-friends of the user
+
+Null hypothesis (what we expect if there is no influence):
+
+***There is no difference between friend and non-friend rating shift.***
+
+And the Verdict Is...
+========================================================
+
+Yes, there is ***statistically significant influence***...
+
+```{r results_post_reorg, echo=FALSE, fig.height=7, fig.width=12}
+
+# Read in the query results restricted to reviews following the Yelp site
+# reorganization, as we want to see user influence results that apply to
+# the site as it is now.
+
+# Note this must be run in a directory that has been set up as per instructions at:
+#   https://github.com/ptressel/yelp_friend_analysis
+# and the analysis code in the main report:
+#   yelp_friend_analysis_report.Rmd
+# must already have been run.
+
+friend_stats_post <- read.csv("data/friend_review_statistics_post_rc_ge_3.csv", sep=";")
+
+friend_stats_post$delta_friends <-
+    (friend_stats_post$avg_review_stars_1_1 - friend_stats_post$avg_review_stars_1_0) *
+    sign(friend_stats_post$reference_stars - friend_stats_post$avg_review_stars_1_0)
+friend_stats_post$delta_non_friends <-
+    (friend_stats_post$avg_review_stars_0_1 - friend_stats_post$avg_review_stars_0_0) *
+    sign(friend_stats_post$reference_stars - friend_stats_post$avg_review_stars_0_0)
+wilcox.result_post <- wilcox.test(friend_stats_post$delta_friends,
+                                  friend_stats_post$delta_non_friends,
+                                  paired=TRUE)
+
+# Compute the size of the effect restricted to after the site reorganization.
+friend_stats_post$delta_of_delta <- friend_stats_post$delta_friends -
+    friend_stats_post$delta_non_friends
+delta_of_delta_post_mean <- mean(friend_stats_post$delta_of_delta)
+delta_of_delta_post_sd <- sd(friend_stats_post$delta_of_delta)
+delta_of_delta_post_shift <- delta_of_delta_post_mean / delta_of_delta_post_sd
+
+# Show the size of the effect graphically -- plot a histogram of the
+# difference of the friend and non-friend differences, and show the mean
+# location, with the location of zero for reference.
+par(oma=c(0,0,0,0), mar=c(4,4,3,1), mgp=c(2,1,0), cex=2)
+color_zero = "green4"
+color_mean = "red2"
+
+delta_of_delta_post_hist <- hist(friend_stats_post$delta_of_delta,
+                            breaks=seq(from=-3.0, to=4.0, by=0.1),
+                            freq=FALSE,
+                            include.lowest=TRUE,
+                            main="Difference between friend rating shift\nand non-friend rating shift",
+                            xlab="Friend difference - non-friend difference",
+                            cex.lab=1.1)
+abline(v=0, col=color_zero, lwd=5, lty=2)
+abline(v=delta_of_delta_post_mean, col=color_mean, lwd=5, lty=2)
+legend("topright", legend=c("No shift", "Observed shift"),
+       col=c(color_zero, color_mean), lwd=3)
+```
+
+It's just (shall we say) ***subtle*** influence...
+
+What does that mean?
+========================================================
+
+Probability of getting those results if no influence?
+
+- `r signif(unlist(wilcox.result_post["p.value"]), digits=3)`
+- That's almost zero probability
+
+How much influence?
+
+- Average effect is about `r 100 * signif(delta_of_delta_post_shift, digits=2)`% of typical rating shift
+- Not big compared to the "noise", but not completely trivial
+
+Should Yelp promote friendship? or drop it?
+
+- Good if it increases engagement
+- But perhaps not good if it skews ratings
+- Amount of influence seems not enough to worry about

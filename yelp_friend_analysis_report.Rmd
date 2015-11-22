@@ -1,0 +1,970 @@
+---
+output: pdf_document
+geometry: bottom=0.5in, top=0.3in, left=0.5in, right=0.5in
+fontsize: 11pt
+---
+
+## Title
+
+**Does Yelp Friendship Influence Reviews?**  
+Patricia Tressel, November 18, 2015  
+
+## Introduction
+
+On social media platforms like Facebook, the friend relationship is at the
+core of the interaction between users, and clearly affects user actions on
+the site. But on Yelp, where the primary function is reviewing and finding
+businesses, does the friend relationship do anything at all?
+
+Using the Yelp Challenge data, http://www.yelp.com/dataset_challenge, let's
+see if we can determine whether friendship affects the most important active
+user behavior -- reviewing a business.  We'll limit this to looking at the
+star rating, and ask:
+
+***Does a negative or positive review by a user affect later reviews by their
+friends, by an amount different from any change in non-friend reviews?***
+
+This is also an exercise in attempting to do analysis on relational data,
+using a relational database, so we'll conclude with some tips and tricks.
+The code is an unholy mixture of bash, Python, SQL, and R, and may be found
+at: https://github.com/ptressel/yelp_friend_analysis
+
+```{python setup, echo=FALSE}
+
+# Before getting started, we need to check that the data is present, and do
+# some preliminary setup.
+
+import os.path
+import sys
+
+# The Yelp Challenge data must be in a subdirectory called data. Look for that
+# and the specific files we need.
+data_dir = "data"
+business_file = "yelp_academic_dataset_business.json"
+review_file = "yelp_academic_dataset_review.json"
+user_file = "yelp_academic_dataset_user.json"
+# The MySQL config file containing the database access info for this project must
+# be in the same directory as this script.
+mysql_config_file = "my.cnf"
+if not os.path.isdir("data") or \
+   not os.path.exists(os.path.join(data_dir, business_file)) or \
+   not os.path.exists(os.path.join(data_dir, review_file)) or \
+   not os.path.exists(os.path.join(data_dir, user_file)) or \
+   not os.path.exists(mysql_config_file):
+   print "Can't find data or MySQL config file. Please see README.md for instructions."
+   sys.exit(1)
+
+# Read in the MySQL config file and convert it to a Python- and R-readable script.
+with open("my.cnf", "r") as cnf:
+    client = False
+    client_done = False
+    user = None
+    pwd = None
+    db_client = False
+    db_client_done = False
+    db_user = None
+    db_pwd = None
+    database = None
+    for line in cnf:
+        line = line.strip()
+        if client:
+            # Since there's no more while not user or not pwd loop, have to
+            # test explicitly for when we've found both.
+            if user and pwd:
+                client = False
+                client_done = True
+            elif line.startswith("user"):
+                _, user = line.split("=")
+                user = user.strip()
+            elif line.startswith("password"):
+                _, pwd = line.split("=")
+                pwd = pwd.strip()
+        elif db_client:
+            if db_user and db_pwd and database:
+                db_client = False
+                db_client_done = True
+            elif line.startswith("user"):
+                _, db_user = line.split("=")
+                db_user = db_user.strip()
+            elif line.startswith("password"):
+                _, db_pwd = line.split("=")
+                db_pwd = db_pwd.strip()
+        else:
+            if client_done and db_client_done:
+                break
+            elif line == "[client]":
+                # We're at the [client] block.
+                client = True
+            elif line.startswith("[client"):
+                # We're at the db client block.
+                db_client = True
+                # Extract the database name.
+                database = line[len("[client"):len(line)-1]
+            elif line == "":
+                # If we got here, we didn't find all the necessary pieces.
+                raise ValueError("""
+my.cnf does not have both client groups with user and password.
+""")
+
+# Now write those out to a file that can be imported.
+with open("my_cnf.py", "w") as cnf_py:
+    cnf_py.write("root_user='%s'\n" % user)
+    cnf_py.write("root_pwd='%s'\n" % pwd)
+    cnf_py.write("db_user='%s'\n" % db_user)
+    cnf_py.write("db_pwd='%s'\n" % db_pwd)
+    cnf_py.write("database='%s'\n" % database)
+```
+
+```{python process_user_data, echo=FALSE}
+
+import os.path
+import sys
+
+data_dir = "data"
+user_file = "yelp_academic_dataset_user.json"
+user_core = "user_core.csv"
+user_id_to_key = "user_id_to_key.json"
+user_friend = "user_friend.csv"
+user_friend_lt_min = "user_friend_lt_min.csv"
+
+# Check whether we have already created the files produced by this chunk,
+# and exit if so. Note that exiting with sys.exit(0) terminates the Python
+# process, so could not do this if using knitiron.
+# @ToDo: Refactor all the Python chunks to put code inside functions.
+# Call function, and have it return if no work to do.
+if os.path.exists(os.path.join(data_dir, user_core)) and \
+   os.path.exists(os.path.join(data_dir, user_id_to_key)) and \
+   os.path.exists(os.path.join(data_dir, user_friend)) and \
+   os.path.exists(os.path.join(data_dir, user_friend_lt_min)):
+    sys.exit(0)
+
+import simplejson as json
+import unicodecsv as csv
+
+# Core table headers.
+core_headers = [
+    "user_key",
+    "friend_count",
+]
+
+# We need to generate a sequence number as key for the user tables...
+user_key_seq = 0
+# ...and relate the user_id to the sequence number and friend count.
+user_id_to_key = {}
+
+# We need to make two passes over the user file. In the first, we assign a short integer
+# sequence number key to replace the long user id. In the second, we'll extract the
+# friends, but for that, we need a complete set of assigned user keys.
+with open(os.path.join(data_dir, user_file), "rb") as user, \
+     open(os.path.join(data_dir, user_core), "wb") as user_core_csv:
+
+    core_writer = csv.writer(user_core_csv, delimiter=";")
+    # Write column headings.
+    core_writer.writerow(core_headers)
+
+    for line in user:
+        row = json.loads(line)
+        user_id = row["user_id"]
+        # Primary key for this user.
+        user_key_seq += 1
+        if "friends" in row:
+            # Make sure they are not duplicated.
+            friend_count = len(list(set(row["friends"])))
+        else:
+            friend_count = 0
+        # Record the id vs. key and friend count.
+        user_id_to_key[user_id] = (user_key_seq, friend_count)
+        core_writer.writerow([user_key_seq, friend_count])
+
+# Write out the assigned user keys.
+with open("data\\user_id_to_key.json", "w") as user_id_to_key_json:
+    json.dump(user_id_to_key, user_id_to_key_json)
+
+# Second pass, to extract friends.
+
+MIN_FRIEND_COUNT = 50
+friend_headers = ["user_key", "friend_key"]
+
+with open(os.path.join(data_dir, user_file), "rb") as user, \
+     open(os.path.join(data_dir, user_friend), "wb") as friend_csv, \
+     open(os.path.join(data_dir, user_friend_lt_min), "wb") as friend_lt_min_csv:
+
+    writer = csv.writer(friend_csv, delimiter=";")
+    writer_lt_min = csv.writer(friend_lt_min_csv, delimiter=";")
+
+    # Write column headings.
+    writer.writerow(friend_headers)
+    writer_lt_min.writerow(friend_headers)
+    
+    for line in user:
+        row = json.loads(line)
+        user_id = row["user_id"]
+        user_key, _ = user_id_to_key[user_id]
+        if "friends" in row:
+            friends = row["friends"]
+            # Make sure they are not duplicated. (They're not...)
+            friends = list(set(friends))
+            friend_count = len(friends)
+            for friend_id in friends:
+                friend_key, _ = user_id_to_key[friend_id]
+                if friend_count >= MIN_FRIEND_COUNT:
+                    writer.writerow([user_key, friend_key])
+                else:
+                    writer_lt_min.writerow([user_key, friend_key])
+```
+
+```{python process_review_data, echo=FALSE}
+
+import os.path
+import sys
+
+data_dir = "data"
+review_file = "yelp_academic_dataset_review.json"
+review_core = "review_core.csv"
+review_core_lt_min = "review_core_lt_min.csv"
+business_id_to_key = "business_id_to_key.json"
+user_id_to_key = "user_id_to_key.json"
+
+# Check whether we have already created the files produced by this chunk,
+# and exit if so.
+if os.path.exists(os.path.join(data_dir, review_core)) and \
+   os.path.exists(os.path.join(data_dir, review_core_lt_min)):
+    sys.exit(0)
+
+# Split the review data into a part that requires the business to be
+# sufficiently popular, by putting reviews for businesses with >= some minimum
+# number of reviews, into one file, and all the rest in another.  The "popular"
+# file can be uploaded first, and the rest deferred.  This is an attempt to
+# speed up queries and assure that we have enough friend reviews.
+
+import unicodecsv as csv
+import simplejson as json
+
+MIN_REVIEW_COUNT = 50
+
+# The reviews will need a unique key for indexing.
+review_key = 0
+
+review_headings = [
+    "review_key",
+    "business_key",
+    "user_key",
+    "stars",
+    "date",
+    ]
+
+# In order to associate the review with the sequence number keys being used
+# for the business and user tables, we'll need to look those up using the
+# character user_id and business_id supplied in the review data.  Read those
+# both into dicts with the ids as keys and the sequence numbers as values.
+with open(os.path.join(data_dir, business_id_to_key), "r") as business_id_to_key_json:
+    business_id_to_key = json.load(business_id_to_key_json)
+with open(os.path.join(data_dir, user_id_to_key), "r") as user_id_to_key_json:
+    user_id_to_key = json.load(user_id_to_key_json)
+
+with open(os.path.join(data_dir, review_file), "rb") as review, \
+     open(os.path.join(data_dir, review_core.csv), "wb") as review_core_csv, \
+     open(os.path.join(data_dir, review_core_lt_min.csv), "wb") as review_core_lt_min_csv:
+
+    core_writer = csv.writer(review_core_csv, delimiter=";")
+    core_lt_min_writer = csv.writer(review_core_lt_min_csv, delimiter=";")
+
+    # Write column headings.
+    core_writer.writerow(review_headings)
+    core_lt_min_writer.writerow(review_headings)
+
+    for line in review:
+        review_key += 1
+        row = json.loads(line)
+
+        # Look up business_key and user_key.
+        business_key, review_count = business_id_to_key[row["business_id"]]
+        user_key, friend_count = user_id_to_key[row["user_id"]]
+
+        if review_count >= MIN_REVIEW_COUNT:
+            # This is a review for a sufficiently "popular" business.
+            core_writer.writerow([
+                review_key,
+                business_key,
+                user_key,
+                row["stars"],
+                row["date"],
+            ])
+        else:
+            core_lt_min_writer.writerow([
+                review_key,
+                business_key,
+                user_key,
+                row["stars"],
+                row["date"],
+            ])
+```
+## Methods and Data
+
+### Overview and terminology
+
+We'll compare the ratings of a business by a user's friends, before and after
+the user posts a review. Because a change in ratings might be due to an actual
+change in the business quality, we'll use the change in non-friend reviews
+before and after the same date as a baseline. That is, we'll compare the
+average rating of each business by friends of each user before and after that
+user's review, versus the change in non-friend ratings, and see if friend
+ratings shift in the direction of the user's rating more than do non-friend
+reviews.
+
+But first -- a little information about the friend relationship on Yelp.
+
+```{r fraction_with_friends, echo=FALSE}
+
+# This shows an example of doing a MySQL query from R.
+require(RMySQL, quietly=TRUE)
+
+# <no laughing>
+# Read in the Python file with the db name.  It contains only assignments
+# and R will take equals for assignments.
+# </no laughing>
+source("my_cnf.py", echo=FALSE, verbose=FALSE)
+# Construct the client group name.
+client.group <- paste0("[client", database, "]")
+
+# Open a connection. This must be run in the directory containing the local
+# MySQL configuration file, my.cnf. This is different from the main config
+# file in the MySQL installation directory and from any other config files
+# that whoever is running this may have -- this config file is used only
+# for the database in this friend analysis. The path to the local my.cnf
+# file must be absolute -- this is not stated in the RMySQL documentation.
+# Add the cwd to the path.
+cnf.path <- paste(getwd(), "my.cnf", sep="/")
+# And connect to the database.
+cnx <- suppressWarnings(dbConnect(MySQL(), dbname=database,
+                        groups=client.group, default.file=cnf.path))
+
+# Get the count of all users, and the count of those without friends.
+# Note the MySQL representation of false is zero, so just as with R, one can
+# sum a boolean column to get the number of true values.
+cmd <-
+"SELECT
+COUNT(*) AS num_users,
+SUM(friend_count = 0) AS num_users_wo_friends
+FROM user;"
+# With the current version of RMySQL, this will produce a warning message
+# saying it is doing a type conversion from a decimal MySQL column to an
+# R numeric. Apparently this is removed in the development version of RMySQL
+# but not yet in the stable version. So for now, wrap this in suppressWarnings.
+cmd.handle <- suppressWarnings(dbSendQuery(cnx, cmd))
+# Get the result in a data frame.
+num_users_df <- suppressWarnings(fetch(cmd.handle, n=-1))
+# > str(num_users_df)
+# 'data.frame':	1 obs. of  2 variables:
+#  $ num_users           : num 366715
+#  $ num_users_wo_friends: num 192621
+pct_users_wo_friends <-
+    100 * num_users_df$num_users_wo_friends / num_users_df$num_users
+
+# Close the connection. This command produces output. Capture it so it won't
+# go into the doc.
+eat_output <- suppressWarnings(dbDisconnect(cnx))
+```
+
+* It is mutual -- a friend request must be accepted to take effect.
+* It is not the same as following (being a fan of) a user -- that is
+  unidirectional.
+* Only $`r signif(pct_users_wo_friends, digits=3)`$% of Yelp users in the
+  dataset even have friends.
+* Previously, reviews by friends were shown prominently in the list of
+  reviews of a business, but that was removed in a redesign of the Yelp
+  website on or before 2014-02-11.
+
+The Yelp Challenge data includes the following fields that are relevant:
+
+* For each user, their list of friends.
+* For each review, the author, business, rating, date.
+
+These are refactored into a relational database, starting with:
+
+* friend table, relating pairs of users
+* review table, relating user and business, with rating, date
+
+Additional tables and indices are used to support query construction and
+optimization, and hold intermediate and final results.
+
+This terminology will be used to describe the question and results:
+
+* *Target review* means the review of which the influence is being measured.
+* *Target reviewer* means the author of the target review.
+* *Friend* or *non-friend* means other users who review the same business,
+  who are either friends or not of the target reviewer.
+* *Before* and *after* refer to reviews of the same business that occur on
+  dates <= or > the target review.
+
+### Description of the question
+
+For a given target review, compute the mean rating of the same business by
+friends and non-friends of the target reviewer, for reviews before the
+target review (which would not have been influenced by it) and after (which
+might have been influenced by it).
+
+For friends and non-friends separately, compute the
+*difference in the mean rating, before and after the target review*,
+taken in the
+*same direction as the difference between the mean rating before and the*
+*target review rating*.
+
+The above query produces two values for each distinct target reviewer
+and business that had a complete set of the four friend / non-friend,
+before / after cases. Again, one value represents the possible influence
+of the review on friends, and the other on non-friends.
+
+The null hypothesis is that there is no difference between the friend and
+non-friend values, indicating no influence of friendship on reviews.
+
+Since we have oriented the difference in the direction of the target review,
+this will let us look beyond just whether there is a difference or not.
+We are computing a shift in ratings toward the target review. If friends of
+the target reviewer react more strongly than non-friends toward the target
+review, then we would expect a positive difference between the friend and
+non-friend values, but if they react less strongly than non-friends, or even
+react against the target review rating, we would expect a negative difference
+of differences. So to see the size of the effect, if any, we can compute the
+difference between the friend and non-friend differences, and take the mean.
+
+### Restrictions on included data
+
+In order to have paired before and after results for friends and non-friends,
+we must have samples that fall into all four cases. Some restrictions are
+intended to cut down the size of the queries, or assure that most results will
+have at least a few reviews by other reviewers falling into all four cases:
+
+* Only include businesses with more than a minimum number (50) of reviews.
+* Only include target reviewers with more than a minimum number (50) of
+  friends. The "friend" case is much more sparse than the non-friend case,
+  so without this restriction, there would be a lot of wasted query time,
+  as low-friend target reviewers would have empty sets for the two
+  friend cases.
+* To reduce dependence on samples that may be idiosyncratic, require at
+  least a small minimum (3) of other reviews for all four cases.
+* To simplfy the queries, although one user might review a business more
+  than once, only the first review by a user is included as a target review.
+  
+```{r read_query_results, echo=FALSE}
+
+# Read in the query results for the whole date range and restricted to
+# reviews following the Yelp site reorganization, so we can report the
+# number of surviving examples with the above restrictions.
+
+friend_stats <- read.csv("data/friend_review_statistics_rc_ge_3.csv", sep=";")
+friend_stats_post <- read.csv("data/friend_review_statistics_post_rc_ge_3.csv", sep=";")
+num_friend_stats <- nrow(friend_stats)
+num_friend_stats_post <- nrow(friend_stats_post)
+```
+
+The number of complete samples remaining was $`r num_friend_stats`$.
+Restricting to only reviews after the site reorganization, the number of
+complete samples was $`r num_friend_stats_post`$.
+
+There is no restriction on the other, non-target, reviewers. They are not
+required to have any minimum number of friends. Note that it is the influence
+on these other reviewers that is being measured, so we do not want to require
+that they have any friends at all.
+
+### Statistical test
+
+An appropriate test is Wilcoxon's signed rank test: We have paired data,
+coming from non-normal distributions, and want to know if the distribution
+of the difference between the pairs is centered on zero. Recall the ratings
+are discrete values in a short range, so their differenences are also
+discrete and bounded, so their distributions cannot be normal.
+
+## Results
+
+### Drumroll...
+
+```{r perform_wilcoxons_test, echo=FALSE}
+
+# For each user and business that they have reviewed (limited to businesses
+# with at least 50 reviews and users with at least 50 friends), we have the
+# review scores for these four cases:
+# Friends of the user -- average review score before and after the user's
+# review.
+# Non-friends of the user -- average review score before and after the user's
+# review.
+
+# The column names in this data indicate which case they apply to.  The column
+# name suffixes have the form _F_A where F and A are in {0,1}.  F = 0 is the
+# non-friend case, F = 1 is the friend case.  A = 0 is the before case, A = 1
+# is the after case.
+
+# The core hypothesis is that friendship matters, and that friends pay
+# attention to friends reviews, so that their scores are moved after a friend
+# posts a review.  So, for friends, we will look posit a shift *in the
+# direction of the user's review, from before to after, and no shift for
+# non-friends.
+
+# Because we are looking for a directional change in paired samples, we'll use
+# a signed test for paired differences.  But because the direction depends on
+# whether the "before" case is above or below the user's score, we'll regard
+# an after - before difference as positive if it is in the same direction as
+# the user - before difference, and negative if the shift is in the "wrong"
+# direction.  Here, compute the after - before differences, and flip the sign
+# depending on the user - before difference.  Yes, this could have been
+# computed as a SQL query.
+
+friend_stats$delta_friends <-
+    (friend_stats$avg_review_stars_1_1 - friend_stats$avg_review_stars_1_0) *
+    sign(friend_stats$reference_stars - friend_stats$avg_review_stars_1_0)
+friend_stats$delta_non_friends <-
+    (friend_stats$avg_review_stars_0_1 - friend_stats$avg_review_stars_0_0) *
+    sign(friend_stats$reference_stars - friend_stats$avg_review_stars_0_0)
+
+# Apply the Wilcoxon signed rank test.
+wilcox.result <- wilcox.test(friend_stats$delta_friends,
+                             friend_stats$delta_non_friends, paired=TRUE)
+
+# > wilcox.result
+#
+# 	Wilcoxon signed rank test with continuity correction
+# data:  friend_stats$delta_friends and friend_stats$delta_non_friends
+# V = 488220000, p-value < 2.2e-16
+# alternative hypothesis: true location shift is not equal to 0
+
+# The actual p-value it returns is much more extreme.
+# > wilcox.result["p.value"]
+# $p.value
+# [1] 3.72569e-179
+```
+
+Wilcoxon's signed rank test for the entire date range rejects the null
+hypothesis with p-value
+$`r signif(unlist(wilcox.result["p.value"]), digits=3)`$.
+
+### Well, that was unexpected.
+
+The p-value is effectively zero. So there is apparently a statistically
+significant difference between the review ratings of friends versus
+non-friends, before and after a user's review.
+
+### Dependence on prominence of friend reviews
+
+Is this due to showing friend reviews at the top of the review list for a
+business? That is, does the effect vanish after the Yelp site reorganization,
+after which that feature is gone? There are not nearly as many samples
+for this case, so we don't expect as definitive a result...but is there any
+effect?
+
+```{r perform_wilcoxons_test_post_reorg, echo=FALSE}
+
+friend_stats_post$delta_friends <-
+    (friend_stats_post$avg_review_stars_1_1 - friend_stats_post$avg_review_stars_1_0) *
+    sign(friend_stats_post$reference_stars - friend_stats_post$avg_review_stars_1_0)
+friend_stats_post$delta_non_friends <-
+    (friend_stats_post$avg_review_stars_0_1 - friend_stats_post$avg_review_stars_0_0) *
+    sign(friend_stats_post$reference_stars - friend_stats_post$avg_review_stars_0_0)
+wilcox.result_post <- wilcox.test(friend_stats_post$delta_friends,
+                                  friend_stats_post$delta_non_friends,
+                                  paired=TRUE)
+```
+
+Wilcoxon's signed rank test still rejects the null, in this case with
+p-value $`r signif(unlist(wilcox.result_post["p.value"]), digits=3)`$.
+
+So the effect persists even without featured friend reviews.
+
+### Size of the effect
+
+```{r size_of_effect, echo=FALSE}
+
+# Compute the size of the effect for all samples.
+friend_stats$delta_of_delta <- friend_stats$delta_friends -
+    friend_stats$delta_non_friends
+# > range(friend_stats$delta_of_delta)
+# [1] -3.17498  3.44876
+delta_of_delta_mean <- mean(friend_stats$delta_of_delta)
+# > delta_of_delta_mean
+# [1] 0.0830608
+delta_of_delta_range <- range(friend_stats$delta_of_delta)
+delta_of_delta_span <- delta_of_delta_range[2] - delta_of_delta_range[1]
+delta_of_delta_sd <- sd(friend_stats$delta_of_delta)
+delta_of_delta_shift <- delta_of_delta_mean / delta_of_delta_sd
+
+# And compute it restricted to after the site reorganization.
+friend_stats_post$delta_of_delta <- friend_stats_post$delta_friends -
+    friend_stats_post$delta_non_friends
+# > range(friend_stats_post$delta_of_delta)
+# [1] -2.07292  3.60260
+delta_of_delta_post_mean <- mean(friend_stats_post$delta_of_delta)
+# > delta_of_delta_post_mean
+# [1] 0.1150822
+delta_of_delta_post_range <- range(friend_stats_post$delta_of_delta)
+delta_of_delta_post_span <- delta_of_delta_post_range[2] -
+    delta_of_delta_post_range[1]
+delta_of_delta_post_sd <- sd(friend_stats_post$delta_of_delta)
+delta_of_delta_post_shift <- delta_of_delta_post_mean / delta_of_delta_post_sd
+```
+
+So, it's statistically significant...but is it meaningful? That is, is the
+effect so tiny that it's irrelevant? The mean difference between the friend
+and non-friend changes in ratings over all dates is
+$`r round(delta_of_delta_mean, digits=3)`$.
+Restricted to reviews after the Yelp site reorganization, the mean is
+$`r round(delta_of_delta_post_mean, digits=3)`$.
+
+To visualize the size of the effect, we'll histogram the differences between
+the friend and non-friend before / after differences, and show where the mean
+difference of differences is, compared to zero.
+
+```{r plot_size_of_effect, echo=FALSE, fig.height=3, fig.width=7}
+
+# Note: fig.height and fig.width are stated in the documentation to be in
+# inches. This is clearly false. Once upon a time, they worked as expected.
+# Now, I'm just using trial and error to get a pair of values that produce
+# plots that are not squeezed into a half-page square.
+
+# Show the size of the effect graphically -- plot a histogram of the
+# difference of the friend and non-friend differences, and show the mean
+# location, with the location of zero for reference.
+par(mfrow=c(1,2), oma=c(0,0,0,0), mar=c(4,4,2,1), mgp=c(2,1,0))
+color_zero = "green4"
+color_mean = "red2"
+
+# Show the distribution for all samples.
+delta_of_delta_hist <- hist(friend_stats$delta_of_delta,
+                            breaks=seq(from=-3.5, to=3.5, by=0.1),
+                            freq=FALSE,
+                            include.lowest=TRUE,
+                            main="All samples",
+                            xlab="Friend difference - non-friend difference",
+                            cex.main=1.0, cex.lab=0.9)
+abline(v=0, col=color_zero, lwd=3, lty=2)
+abline(v=mean(friend_stats$delta_of_delta), col=color_mean, lwd=3, lty=2)
+legend("topright", legend=c("zero", "mean"),
+       col=c(color_zero, color_mean), lwd=3, cex=0.9)
+
+# And show it restricted to after the site reorganization. Keep the same width
+# of the x axis, but shift it to accommodate the different range.
+delta_of_delta_post_hist <- hist(friend_stats_post$delta_of_delta,
+                            breaks=seq(from=-3.0, to=4.0, by=0.1),
+                            freq=FALSE,
+                            include.lowest=TRUE,
+                            main="After Yelp site reorganization",
+                            xlab="Friend difference - non-friend difference",
+                            cex.main=1.0, cex.lab=0.9)
+abline(v=0, col=color_zero, lwd=3, lty=2)
+abline(v=delta_of_delta_post_mean, col=color_mean, lwd=3, lty=2)
+legend("topright", legend=c("zero", "mean"),
+       col=c(color_zero, color_mean), lwd=3, cex=0.8)
+```
+
+So both are about 0.1. That doesn't seem large, but what is an appropriate
+scale against which to evaluate the effect size? The range of a mean of ratings
+is 1-5, so the before / after difference has a range of -4 to 4 and the range
+of the difference between two before / after differences is -8 to 8, so has a
+span of 16. On that scale, looking at just the smaller effect for all dates,
+the mean is shifted from 0 by about 0.08 / 16 = 0.005 or 0.5%. But
+is that fair? There aren't even any samples out at the ends of that range --
+the actual range is about $`r ceiling(delta_of_delta_span)`$. Even then, the
+tails are very low probability, as we can see in the plot.
+
+Another way we can see that the scale shouldn't be based on the full 1-5 range
+of ratings is that it is not based on the actual range *for each business*.
+If we histogram the ratings irrespective of business, then yes, we see a
+they are spread over all rating values with no central peak, and with some
+preference for higher ratings.
+
+But that does not account for the differences in quality of businesses. That
+may cause such a spread merely because each different business merits a
+different rating, not because users are fickle in their reviews. If, instead,
+we compute the distribution of ratings *for each business separately*, then we
+can adjust for different business qualities by
+*aligning the means of those distributions* before averaging them.
+
+```{python construct_combined_ratings, echo=FALSE}
+
+# Get the discrete distribution of stars for each business (in the set
+# of high-review-count businesses that we've been using for this analysis).
+# This gives us normalized weights for each star value, per business.  If we
+# just combine those directly, that will ignore the fact that businesses
+# actually do have different objective quality, and that their distributions
+# will differ due to that. Directly averaging the per-business distributions
+# the will wash out any peak. The raw distribution of stars has no peak.
+# Rather, we want to align the means of all the distributions by shifting
+# them to zero, then combine them in an appropriate way.
+
+# Combining them is not straightforward, for several reasons.
+# -- The mean for each business may not be an integer, so after the mean
+# is subtracted, the ratings have moved to non-integer locations.
+# -- These are *not* point samples from a *continuous* distribution -- they
+# are shifted *discrete* distributions.  It would only be an approximation
+# to treat the weighted values as though they were point samples from a
+# continuous distribution, and add each to a histogram at its single position.
+# Better would be to treat each business's discrete distribution as though it
+# were a continuous step function, with the steps centered at each of its
+# shifted rating positions.
+# -- That is very specific to this problem, and there doesn't appear to be a
+# standard R package that will do this, so it would have to be coded by hand.
+# This was easier in Python.
+
+import unicodecsv as csv
+import simplejson as json
+import math
+# This must be run in the directory that contains the sql_utilities.py file.
+from sql_utilities import connect_as_db_user, populate_table, do_select
+
+# Open a connection as the database user.
+cnx, cursor = connect_as_db_user()
+
+# Construct the per business distributions.
+per_business_stars_cmd = """
+INSERT INTO per_business_stars
+SELECT business_key,
+SUM(stars = 1) / COUNT(*) AS star_1,
+SUM(stars = 2) / COUNT(*) AS star_2,
+SUM(stars = 3) / COUNT(*) AS star_3,
+SUM(stars = 4) / COUNT(*) AS star_4,
+SUM(stars = 5) / COUNT(*) AS star_5,
+AVG(stars) AS avg_review_stars
+FROM high_count_review
+GROUP BY business_key;
+"""
+
+# This function will only execute the INSERT query if the table is empty,
+# so it is safe to re-run this code chunk.
+populate_table(cnx, cursor, "per_business_stars", per_business_stars_cmd)
+
+# Read in the results.
+cmd = """
+SELECT star_1, star_2, star_3, star_4, star_5, avg_review_stars
+FROM per_business_stars;
+"""
+rows = do_select(cnx, cursor, cmd)
+cnx.close()
+
+# Shift the stars for each business by the mean for that business, and write
+# out pairs of the shifted point and its weight. If wanted, we can use that
+# do an approximate variance computation in R using the Hmisc.wts.var function.
+# It does not require that the weights be normalized overall. The weights for
+# each business will sum to one, and the businesses are weighted equally.
+#
+# At the same time, construct a histogram by treating each business's points
+# as defining a stepwise continuous distribution with steps of width one
+# centered at the points.  Make a histogram that covers the range from -4.5
+# to 4.5 (that's the extreme of the possible point locations from -4 to 4,
+# extended out by 0.5 on either side).  Use bins of size 0.1, which worked
+# well for the difference of differences histogram.
+
+bin_width = 0.1
+bins_per_point = int(1.0 / bin_width + 0.5)  # Beware roundoff error here
+bin_ends = [-4.5, 4.5]
+n_bins = int((bin_ends[1] - bin_ends[0]) * 10)
+# Include values for the ends of the outermost bins.
+bin_breaks = [x * bin_width + bin_ends[0] for x in range(0, n_bins + 1)]
+unnormalized_histogram = [0] * n_bins
+
+weighted_stars_headers = ["point", "weight"]
+weighted_stars_file = r"data\\per_business_weighted_centered_stars.csv"
+with open(weighted_stars_file, "wb") as weighted_stars_handle:
+    writer = csv.writer(weighted_stars_handle, delimiter=";")
+    writer.writerow(weighted_stars_headers)
+    for row in rows:
+        mean = row[5]
+        for star in range(1,6):
+            weight = row[star-1]
+            # Don't bother writing out zeros.
+            if weight:
+                point = star - mean
+                writer.writerow([point, weight])
+                # Split this weight across the bins it spans.  Each star covers
+                # a span of one about its center point, so 0.5 on either side
+                # of the point.
+                point_low = point - 0.5
+                point_high = point + 0.5
+                # Simplest would be to loop over all the bin breaks and see how
+                # much they overlap the above span, but we can shorten that by
+                # computing the start and end indices of the low ends of the
+                # covered bins.  We've included an extra bin break at the end
+                # of bin_breaks, so can safely index the breaks one past the
+                # last index.
+                first = int((point_low - bin_ends[0]) / bin_width + 0.5)
+                last = first + bins_per_point
+                for index in range(first, last):
+                    # What fraction of the weight falls in this bin?
+                    # The bin index points to the low end of the bin.
+                    # Overlap of point span and bin:
+                    low = max(point_low, bin_breaks[index])
+                    high = min(point_high, bin_breaks[index+1])
+                    # Since the point span has length one, we don't need to
+                    # divide by the span length.
+                    weight_for_this_bin = weight * (high - low)
+                    unnormalized_histogram[index] += weight_for_this_bin
+
+# Normalize the histogram
+total = sum(unnormalized_histogram)
+normalized_histogram = [x / total for x in unnormalized_histogram]
+half_bin_width = bin_width * 0.5
+bin_centers = [x + half_bin_width for x in bin_breaks[0:len(bin_breaks)-1]]
+
+# Use the bin centers to compute the mean and standard deviation.  Note the
+# mean was constructed to be zero, so this is a sanity check.
+combined_mean = sum([x * w for x, w in zip(bin_centers, normalized_histogram)]) 
+combined_sd = math.sqrt(sum([x * x * w for x, w in zip(bin_centers, normalized_histogram)]) - combined_mean * combined_mean)
+combined_histogram_info = dict(
+    n_bins = n_bins,
+    bin_width = bin_width,
+    bin_ends = bin_ends,
+    bin_breaks = bin_breaks,
+    bin_centers = bin_centers,
+    combined_mean = combined_mean,
+    combined_sd = combined_sd,
+    combined_histogram = normalized_histogram
+)
+
+combined_histogram_file = r"data\\per_business_combined_histogram.json"
+with open(combined_histogram_file, "wb") as combined_histogram_handle:
+    json.dump(combined_histogram_info, combined_histogram_handle)
+```
+
+```{r read_combined_ratings, echo=FALSE}
+
+# Read in the results computed above.
+
+require(RJSONIO, quietly=TRUE)
+combined_histogram_json <-
+    readLines("data/per_business_combined_histogram.json", warn=FALSE)
+combined_histogram_info <- fromJSON(combined_histogram_json)
+```
+
+Here are the raw distribution of ratings, and the averaged per-business
+distributions, where the mean of each is shifted to zero before averaging.
+The standard deviation of the latter is
+$`r signif(combined_histogram_info$combined_sd, digits=3)`$.
+
+```{r rating_distributions, echo=FALSE, fig.height=3, fig.width=7.2}
+
+# First, get a histogram of the stars in the raw data, regardless of business.
+# Mainly want to see how uniform it is, or whether there's a tendency to score
+# in the middle, or skew high or low.  The ratings have been split out into two
+# sets, for businesses with lots of reviews, and less-reviewed businesses --
+# combine those.
+
+par(mfrow=c(1,2), oma=c(0,0,0,0), mar=c(4,4,2,1), mgp=c(2,1,0))
+
+stars <- c(scan("data/review_core_stars.csv", skip=1),
+           scan("data/review_core_lt_min_stars.csv", skip=1))
+stars_table <- table(stars)
+stars_table_normalized <- stars_table / sum(stars_table)
+barplot(stars_table_normalized,
+        main = "Distribution of ratings",
+        xlab = "Rating", ylab = "Density",
+        cex.main=1.0, cex.lab=0.9)
+
+# Next show the combined per-business distributions. Add the bin center
+# positions as names, so that barplot will use them as labels on the x axis.
+# Note how the distribution is skewed so its peak is shifted toward the right,
+# i.e. stars are bunched up toward the higher end, which is what we saw in the
+# raw, un-centered distribution.
+combined_histogram <- combined_histogram_info$combined_histogram
+names(combined_histogram) <- as.character(combined_histogram_info$bin_centers)
+barplot(combined_histogram,
+        main="Averaged business rating distribution",
+        xlab="Centered rating", ylab="Density",
+        cex.main=1.0, cex.lab=0.9)
+```
+
+The traditional scale for a distance from the mean of a distribution would
+be the standard deviation deviation of the same distribution. Here, that is
+$`r signif(delta_of_delta_sd, digits=3)`$, and with that as the scale,
+*the relative effect size is*
+*$`r signif(delta_of_delta_shift, digits=2)`$ or*
+*$`r 100 * signif(delta_of_delta_shift, digits=2)`$%!*
+
+## Discussion
+
+We have a very highly statistically significant effect, that may or may
+not be of a meaningful size, depending on what scale we use to measure it
+against. Using the traditional scale, the effect size appears at least
+somewhat meaningful. Given this, would it be worthwhile for Yelp to promote
+friendship? or drop it?
+
+* It's good if it increases engagement. Review influence may indicate it does.
+* Perhaps not good if it skews ratings.
+
+Are there hints as to what might lead to such an effect? Standard caution
+applies: we can't distinguish causation from
+correlation. Here are some possibilities, that might be avenues for
+further investigation:
+
+* Before the site reorganization, users saw reviews by friends featured
+  prominently when they viewed a business page. After the change, users
+  may still see new reviews by friends in their news feed, or in
+  a friend's profile.
+* Users may send friend requests to users whose reviews they like.
+* People who choose to be friends may have similar tastes.
+* Yelp friends may be friends "in real life".
+* There are in-person Yelp events. Users who meet there may send
+  friend requests to each other.
+
+\pagebreak
+
+## Advice for using a relational database and SQL
+
+This project appeared infeasible at first -- an initial attempt at a query
+to compute some preliminary results had to be killed after running for 24
+hours. Now, the entire process takes less than half a day on my not-high-end
+laptop. Here are recommendations based on that experience. Some of these are
+specific to MySQL.
+
+The main bottleneck will be disk I/O:
+
+* Do not include any unnecessary information in tables. Pull out only the
+  columns needed for a query into a new table, if needed.
+* Replace long identifiers by sequence number keys.
+* Reduce all fields to the minimum width.
+* Do preliminary analysis to identify data that can be excluded, e.g. because
+  it provides little information. Filter these from queries or remove them
+  from tables.
+
+The database system's query optimizer may not produce a good execution plan:
+
+* Look at the query plan with EXPLAIN.
+* Make sure that everything that needs an index has one.
+* Examine the query for subtle inefficiencies.
+* Control the plan explicitly with hints and subqueries.
+* Control the plan by breaking up the query into separate steps or by making
+  temporary tables.
+* Use a different database system that has a better query planner.
+
+General advice:
+
+* Break up large queries into batches -- batched queries may run significantly
+  faster in total than the query run as a whole. For instance, split keys into
+  ranges. The field used for the range must be indexed. If the table has
+  multiple fields in its primary key, add a sequence number field with an
+  index to split into batches.
+* Use inequalities or BETWEEN to specify batch ranges, not LIMIT, which is slow.
+* A hash table index is not useful for range or inequality queries -- make sure
+  the database system is using a B-tree or other ordered index.
+* Some computations are more efficiently done in a procedural language.
+* If you need hierarchical or recursive queries, switch to a database system
+  that supports recursive common table expressions. That does not include
+  MySQL...
+
+Tips for muliple languages in knitr:
+
+* To pass information between code chunks, write it out to disk or database.
+* For disk files, use a commonly supported format such as CSV or JSON.
+* Don't rely on knitr caching in R if work is done in another language between
+  two R chunks.
+* Have a look at the knitiron tool for using IPython and matplotlib with knitr.
+
+And, a trick: In a procedural language that has iteration, it is easy to
+perform a task using multiple different sets of parameters. To simulate this
+in SQL:
+
+* Construct a table to hold the parameter sets, with a column for each
+  parameter, and a row for each set of parameter values needed. Include this
+  table in the FROM clause, and use its columns in constraints in the WHERE
+  clause.
+* If you need all combinations of some parameter values, rather than just
+  specific sets of values, make one table for each parameter, with a single
+  column, and include all values for that parameter as rows. Include all of
+  these tables in FROM and use their columns in WHERE. An example is included
+  in the code for this project.

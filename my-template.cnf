@@ -1,0 +1,8 @@
+[client]
+user=root
+password=change*this*dummy*password
+
+[clientjhu_datasci_capstone_yelp]
+user=put*username*here
+password=change*this*dummy*password
+local-infile=1
