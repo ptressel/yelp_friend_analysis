@@ -597,7 +597,8 @@ ENGINE=InnoDB;
 # Indicator for date before and after a given date.
 after_schema = """
 CREATE TABLE IF NOT EXISTS after (
-val BOOLEAN
+val BOOLEAN,
+PRIMARY KEY (val)
 )
 ENGINE=InnoDB;
 """
@@ -605,7 +606,8 @@ ENGINE=InnoDB;
 # Indicator for selecting friend versus non-friend.
 friend_schema = """
 CREATE TABLE IF NOT EXISTS friend (
-val BOOLEAN
+val BOOLEAN,
+PRIMARY KEY (val)
 )
 ENGINE=InnoDB;
 """
@@ -850,10 +852,12 @@ load_table(cnx, cursor, "high_count_review", r"high_count_review.csv")
 load_table(cnx, cursor, "user_friend", r"user_friend.csv")
 
 # The indicator tables just need rows for false (0) and true (1).
-cmd = "INSERT INTO %s (val) VALUE (0); INSERT INTO after (val) VALUE (1);"
+cmd = "INSERT IGNORE INTO %s (val) VALUE (%s);"
 try:
-    cursor.execute(cmd % "after")
-    cursor.execute(cmd % "friend")
+    cursor.execute(cmd % ("after", 0))
+    cursor.execute(cmd % ("after", 1))
+    cursor.execute(cmd % ("friend", 0))
+    cursor.execute(cmd % ("friend", 1))
     cnx.commit()
 except mysql.connector.Error as err:
     print "Insert into indicator table failed:\n%s" % err
