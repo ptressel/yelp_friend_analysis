@@ -22,13 +22,15 @@ But beware:
 * This will take a long time, perhaps 12 hours, to complete.
 * You should not blindly run stuff you find on the Internet.
 
+If you would prefer to *not* run this code, but just see the result, look at yelp_friend_analysis_report.pdf.
+
 To run this:
 
 * Clone this repository.
 * Create a subdirectory within it called data.
 * Download the Yelp Challenge data from http://www.yelp.com/dataset_challenge into the data subdirectory.
-* Copy the file my-template.cnf to my.cnf. Edit it and replace change*this*dummy*password and
-  put*username*here. In the [client] section, you'll need your actual MySQL root password. In the
+* Copy the file my-template.cnf to my.cnf. Edit it and replace change\*this\*dummy\*password and
+  put\*username\*here. In the [client] section, you'll need your actual MySQL root password. In the
   [clientjhu_datasci_capstone_yelp] section, pick a username and password for this project's
   database, which will be called jhu_datasci_capstone_yelp.
 * Start the MySQL server with the option local_infile=1 (see comments in the Rmd file about this).
